@@ -6,6 +6,7 @@ import cv2
 import gdown
 import argparse
 import numpy as np
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -31,12 +32,7 @@ def load_checkpoint(model, checkpoint_path):
 
 
 def get_palette(num_cls):
-    """ Returns the color map for visualizing the segmentation mask.
-    Args:
-        num_cls: Number of classes
-    Returns:
-        The color map
-    """
+    """ Returns the color map for visualizing the segmentation mask. """
     n = num_cls
     palette = [0] * (n * 3)
     for j in range(0, n):
@@ -55,18 +51,10 @@ def get_palette(num_cls):
 
 
 class Normalize_image(object):
-    """Normalize given tensor into given mean and standard dev
-
-    Args:
-        mean (float): Desired mean to substract from tensors
-        std (float): Desired std to divide from tensors
-    """
-
     def __init__(self, mean, std):
         assert isinstance(mean, (float))
         if isinstance(mean, float):
             self.mean = mean
-
         if isinstance(std, float):
             self.std = std
 
@@ -77,17 +65,12 @@ class Normalize_image(object):
     def __call__(self, image_tensor):
         if image_tensor.shape[0] == 1:
             return self.normalize_1(image_tensor)
-
         elif image_tensor.shape[0] == 3:
             return self.normalize_3(image_tensor)
-
         elif image_tensor.shape[0] == 18:
             return self.normalize_18(image_tensor)
-
         else:
-            assert "Please set proper channels! Normlization implemented only for 1, 3 and 18"
-
-
+            assert "Please set proper channels! Normalization implemented only for 1, 3 and 18"
 
 
 def apply_transform(img):
@@ -98,21 +81,13 @@ def apply_transform(img):
     return transform_rgb(img)
 
 
-
-def generate_mask(input_image, net, palette, device = 'cpu'):
-
-    #img = Image.open(input_image).convert('RGB')
+def generate_mask(input_image, net, palette, device='cpu'):
+    """Generate segmentation mask - returns PIL image"""
     img = input_image
     img_size = img.size
     img = img.resize((768, 768), Image.BICUBIC)
     image_tensor = apply_transform(img)
     image_tensor = torch.unsqueeze(image_tensor, 0)
-
-    alpha_out_dir = os.path.join(opt.output,'alpha')
-    cloth_seg_out_dir = os.path.join(opt.output,'cloth_seg')
-
-    os.makedirs(alpha_out_dir, exist_ok=True)
-    os.makedirs(cloth_seg_out_dir, exist_ok=True)
 
     with torch.no_grad():
         output_tensor = net(image_tensor.to(device))
@@ -121,28 +96,32 @@ def generate_mask(input_image, net, palette, device = 'cpu'):
         output_tensor = torch.squeeze(output_tensor, dim=0)
         output_arr = output_tensor.cpu().numpy()
 
-    classes_to_save = []
-
-    # Check which classes are present in the image
-    for cls in range(1, 4):  # Exclude background class (0)
-        if np.any(output_arr == cls):
-            classes_to_save.append(cls)
-
-    # Save alpha masks
-    for cls in classes_to_save:
-        alpha_mask = (output_arr == cls).astype(np.uint8) * 255
-        alpha_mask = alpha_mask[0]  # Selecting the first channel to make it 2D
-        alpha_mask_img = Image.fromarray(alpha_mask, mode='L')
-        alpha_mask_img = alpha_mask_img.resize(img_size, Image.BICUBIC)
-        alpha_mask_img.save(os.path.join(alpha_out_dir, f'{cls}.png'))
-
-    # Save final cloth segmentations
+    # Create final segmentation
     cloth_seg = Image.fromarray(output_arr[0].astype(np.uint8), mode='P')
     cloth_seg.putpalette(palette)
     cloth_seg = cloth_seg.resize(img_size, Image.BICUBIC)
-    cloth_seg.save(os.path.join(cloth_seg_out_dir, 'final_seg.png'))
+    
     return cloth_seg
 
+
+def apply_mask_extraction(original_cv, segmentation_pil):
+    """Apply mask to extract dress with black background"""
+    # Convert PIL to CV2
+    seg_cv = cv2.cvtColor(np.array(segmentation_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
+    
+    # Resize segmentation to match original
+    seg_resized = cv2.resize(seg_cv, (original_cv.shape[1], original_cv.shape[0]))
+    
+    # Create mask
+    seg_gray = cv2.cvtColor(seg_resized, cv2.COLOR_BGR2GRAY)
+    unique, counts = np.unique(seg_gray, return_counts=True)
+    bg_value = unique[np.argmax(counts)]
+    mask = (seg_gray != bg_value).astype(np.uint8) * 255
+    
+    # Apply mask
+    result = cv2.bitwise_and(original_cv, original_cv, mask=mask)
+    
+    return result
 
 
 def check_or_download_model(file_path):
@@ -161,30 +140,79 @@ def load_seg_model(checkpoint_path, device='cpu'):
     net = load_checkpoint(net, checkpoint_path)
     net = net.to(device)
     net = net.eval()
-
     return net
 
 
-def main(args):
-
+def process_batch(args):
+    """Process all images in input folder"""
+    
     device = 'cuda:0' if args.cuda else 'cpu'
-
-    # Create an instance of your model
+    print(f"Using device: {device}")
+    
+    # Load model once
+    print("Loading segmentation model...")
     model = load_seg_model(args.checkpoint_path, device=device)
-
     palette = get_palette(4)
+    
+    # Setup folders
+    input_folder = args.input_folder
+    output_folder = args.output_folder
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Get all images
+    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(Path(input_folder).glob(ext))
+    
+    print(f"\n📂 Found {len(image_files)} images to process")
+    print(f"📥 Input folder: {input_folder}")
+    print(f"📤 Output folder: {output_folder}\n")
+    
+    # Process each image
+    for idx, img_path in enumerate(image_files, 1):
+        try:
+            print(f"[{idx}/{len(image_files)}] Processing: {img_path.name}...", end=" ")
+            
+            # Load original image
+            original_cv = cv2.imread(str(img_path))
+            original_pil = Image.open(str(img_path)).convert('RGB')
+            
+            # Generate segmentation
+            segmentation_pil = generate_mask(original_pil, model, palette, device)
+            
+            # Extract dress
+            result = apply_mask_extraction(original_cv, segmentation_pil)
+            
+            # Save result
+            output_filename = img_path.stem + '_extracted.png'
+            output_path = os.path.join(output_folder, output_filename)
+            cv2.imwrite(output_path, result)
+            
+            print(f"✅")
+            
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+            continue
+    
+    print(f"\n🎉 All done! Processed {len(image_files)} images")
+    print(f"📁 Check output at: {output_folder}")
 
-    img = Image.open(args.image).convert('RGB')
 
-    cloth_seg = generate_mask(img, net=model, palette=palette, device=device)
-
+def main(args):
+    process_batch(args)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Help to set arguments for Cloth Segmentation.')
-    parser.add_argument('--image', type=str, help='Path to the input image')
-    parser.add_argument('--cuda', action='store_true', help='Enable CUDA (default: False)')
-    parser.add_argument('--checkpoint_path', type=str, default='model/cloth_segm.pth', help='Path to the checkpoint file')
+    parser = argparse.ArgumentParser(description='Batch process cloth segmentation and extraction.')
+    parser.add_argument('--input_folder', type=str, required=True, 
+                        help='Path to input folder with images')
+    parser.add_argument('--output_folder', type=str, required=True,
+                        help='Path to output folder for extracted dresses')
+    parser.add_argument('--cuda', action='store_true', 
+                        help='Enable CUDA (default: False)')
+    parser.add_argument('--checkpoint_path', type=str, default='model/cloth_segm.pth',
+                        help='Path to the checkpoint file')
     args = parser.parse_args()
 
     main(args)
