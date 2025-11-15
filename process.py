@@ -185,8 +185,7 @@ def process_batch(args):
             result = apply_mask_extraction(original_cv, segmentation_pil)
             
             # Save result
-            output_filename = img_path.stem + '_extracted.png'
-            output_path = os.path.join(output_folder, output_filename)
+            output_path = os.path.join(output_folder, img_path.name)
             cv2.imwrite(output_path, result)
             
             print(f"✅")
